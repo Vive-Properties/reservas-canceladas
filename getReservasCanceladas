@@ -1,0 +1,245 @@
+/********* CONFIG *********/
+const CLIENT_ID     = '36321';
+const CLIENT_SECRET = '09295c1c5f886759538f7fb1a51b3919455f2b4ffc943e8534c9eec3d727639d';
+const TZ3            = 'America/Mexico_City';
+
+const PAGE_LIMIT    = 200;
+const MAX_RETRIES   = 4;
+
+// Si quieres filtrar por canal, pon los IDs aquí. Si lo dejas vacío → todos.
+const CHANNEL_IDS   = []; // p.ej. [2018, 2048]
+
+const OUT_SHEET     = 'Hostaway_Reservas_Canceladas_Hoy';
+
+/********* ENTRYPOINT *********/
+function exportReservasCanceladasQueCruzanHoy() {
+  const today = Utilities.formatDate(new Date(), TZ3, 'yyyy-MM-dd');
+  const token = _getHostawayToken_();
+  const auth  = { Authorization: 'Bearer ' + token };
+
+  // 1) Traer reservas que cruzan hoy
+  const reservas = _listarQueCruzanDia_(today, auth, CHANNEL_IDS);
+
+  // 2) Filtrar canceladas
+  const canceladas = reservas.filter(r => _isCanceled_(r.status || r.reservationStatus));
+
+  // 3) Mapear listingId -> internalListingName -> edificio
+  const listingIds = Array.from(new Set(
+    canceladas.map(r => String(r.listingId || r.listingMapId || '')).filter(Boolean)
+  ));
+  const namesMap = listingIds.length ? _fetchListingNamesMap_(listingIds, auth) : {};
+  const edificioPorListing = {};
+  for (const id of listingIds) {
+    const internalName = namesMap[id] || '';
+    edificioPorListing[id] = _deriveEdificio_(internalName);
+  }
+
+  // 4) Escribir a la hoja (agregando "edificio")
+  _writeToSheet_(canceladas, OUT_SHEET, edificioPorListing);
+  Logger.log(`Hoy=${today} | canceladas que cruzan hoy=${canceladas.length}`);
+}
+
+/********* LISTADO: cruzan “hoy” *********/
+function _listarQueCruzanDia_(day, auth, channelIds = []) {
+  const byId = new Map();
+  const loops = (channelIds.length ? channelIds : [null]);
+
+  for (const chId of loops) {
+    let offset = 0;
+    while (true) {
+      const qs = _qs({
+        limit: PAGE_LIMIT,
+        offset: offset,
+        includeResources: 1,
+        arrivalEndDate: day,      // arrival <= day
+        departureStartDate: day,  // departure >= day
+        channelId: chId || ''     // si no hay canal, no se envía
+      });
+
+      const url = 'https://api.hostaway.com/v1/reservations?' + qs;
+      const resp = _fetchRetry_(url, { headers: auth, muteHttpExceptions: true });
+      const code = resp.getResponseCode();
+      if (code !== 200) throw new Error('[Hostaway] HTTP ' + code + ': ' + resp.getContentText());
+
+      const json = JSON.parse(resp.getContentText());
+      const page = Array.isArray(json.result) ? json.result : (json.results || []);
+      if (!page.length) break;
+
+      for (const r of page) {
+        const id = String(r.id || r.reservationId || '');
+        if (id) byId.set(id, r);
+      }
+
+      if (page.length < PAGE_LIMIT) break;
+      offset += PAGE_LIMIT;
+      Utilities.sleep(250);
+    }
+  }
+
+  return Array.from(byId.values());
+}
+
+/********* LISTINGS: nombres -> edificio *********/
+function _fetchListingNamesMap_(ids, auth) {
+  const reqs = ids.map(id => ({
+    url: 'https://api.hostaway.com/v1/listings/' + encodeURIComponent(id),
+    headers: auth,
+    muteHttpExceptions: true
+  }));
+
+  const resps = UrlFetchApp.fetchAll(reqs);
+  const map = {};
+
+  for (let i = 0; i < resps.length; i++) {
+    const res = resps[i];
+    try {
+      if (res.getResponseCode() >= 200 && res.getResponseCode() < 300) {
+        const j = JSON.parse(res.getContentText());
+        const obj = j.result || j;
+        const lid = String(obj.id || ids[i]);
+        map[lid] = String(obj.internalListingName || obj.name || '');
+      } else {
+        // reintento individual
+        const again = _fetchRetry_(reqs[i].url, { headers: auth, muteHttpExceptions: true });
+        const j2 = JSON.parse(again.getContentText());
+        const obj2 = j2.result || j2;
+        const lid2 = String(obj2.id || ids[i]);
+        map[lid2] = String(obj2.internalListingName || obj2.name || '');
+      }
+    } catch (e) {
+      map[ids[i]] = '';
+    }
+  }
+  return map;
+}
+
+/********* AUTH — MISMA ESTRUCTURA *********/
+function _getHostawayToken_() {
+  const url = 'https://api.hostaway.com/v1/accessTokens';
+  const payload = {
+    grant_type: 'client_credentials',
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    scope: 'general'
+  };
+  const options = {
+    method: 'post',
+    contentType: 'application/x-www-form-urlencoded',
+    payload: Object.entries(payload)
+      .map(([k,v]) => k + '=' + encodeURIComponent(v))
+      .join('&'),
+    muteHttpExceptions: true
+  };
+  const resp = _fetchRetry_(url, options);
+  const code = resp.getResponseCode();
+  if (code < 200 || code >= 300) {
+    throw new Error('Auth ERROR ' + code + ': ' + resp.getContentText());
+  }
+  const j = JSON.parse(resp.getContentText());
+  if (!j || !j.access_token) throw new Error('No se obtuvo access_token de Hostaway.');
+  return j.access_token;
+}
+
+/********* HELPERS *********/
+function _isCanceled_(statusRaw) {
+  const s = String(statusRaw || '').toLowerCase().trim();
+  return ['canceled','cancelled','cancelado','cancelada'].includes(s);
+}
+
+function _writeToSheet_(rows, sheetName, edificioMap) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  sh.clearContents();
+
+  const headers = [
+    'reservationId',
+    'status',            // <-- en blanco
+    'status_hostaway',   // <-- valor que llega de Hostaway
+    'guestName','email','phone',
+    'listingId','channel','edificio',
+    'arrivalDate','departureDate',
+    'checkIn','checkOut','nights',
+    'totalPrice','currency','createdAt','updatedAt'
+  ];
+  sh.getRange(1,1,1,headers.length).setValues([headers]);
+
+  const data = rows.map(r => {
+    const resId     = r.id || r.reservationId || '';
+    const statusHw  = r.status || r.reservationStatus || '';
+    const listingId = String(r.listingId || r.listingMapId || '');
+    const edificio  = listingId ? (edificioMap ? (edificioMap[listingId] || '') : '') : '';
+
+    const arr    = (r.arrivalDate || r.checkInDate || r.checkIn || '').toString().slice(0,10);
+    const dep    = (r.departureDate || r.checkOutDate || r.checkOut || '').toString().slice(0,10);
+    const nights = (arr && dep) ? Math.max(0, Math.round((new Date(dep) - new Date(arr)) / 86400000)) : '';
+
+    const name = r.guestName || ((r.firstName || '') + ' ' + (r.lastName || '')).trim();
+
+    return [
+      resId,
+      '',                 // status (vacío)
+      statusHw,           // status_hostaway
+      name,
+      r.email || r.guestEmail || '',
+      r.phone || r.guestPhone || '',
+      listingId,
+      r.channel || r.channelId || '',
+      edificio,
+      arr,
+      dep,
+      r.checkIn || '',
+      r.checkOut || '',
+      nights,
+      r.totalPrice || r.price || '',
+      r.currency || '',
+      r.created || r.createdAt || '',
+      r.updated || r.updatedAt || ''
+    ];
+  });
+
+  if (data.length) sh.getRange(2,1,data.length,headers.length).setValues(data);
+  sh.setFrozenRows(1);
+}
+
+
+/** Deriva el “edificio” desde el internalListingName (regla amigable) */
+function _deriveEdificio_(internalName) {
+  if (!internalName) return '';
+  // Caso típico: "Colmena – Tribu Chapultepec (Depto 301)" → "Tribu Chapultepec"
+  if (internalName.indexOf('-') >= 0) {
+    const partes = internalName.split('-').map(p => p.trim());
+    const raw = partes.length >= 2 ? partes[1] : partes[partes.length - 1];
+    return raw.replace(/\s*\(.*\)$/, '').trim();
+  }
+  // Si contiene “Tribu …”
+  const m = internalName.match(/Tribu[\w\s]*\S+/i);
+  if (m) return m[0].replace(/\s*\(.*\)$/, '').trim();
+  // Fallback: el nombre completo sin paréntesis
+  return internalName.replace(/\s*\(.*\)$/, '').trim();
+}
+
+function _qs(obj) {
+  return Object.keys(obj)
+    .filter(k => obj[k] !== undefined && obj[k] !== null && obj[k] !== '' && obj[k] !== false)
+    .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(String(obj[k])))
+    .join('&');
+}
+
+function _fetchRetry_(url, options, maxRetries = MAX_RETRIES) {
+  let wait = 500;
+  for (let i = 0; i <= maxRetries; i++) {
+    const res = UrlFetchApp.fetch(url, Object.assign({
+      followRedirects: true,
+      validateHttpsCertificates: true,
+      muteHttpExceptions: true
+    }, options));
+    const code = res.getResponseCode();
+    if (code >= 200 && code < 300) return res;
+    if (code === 429 || code === 408 || (code >= 500 && code < 600)) {
+      if (i === maxRetries) throw new Error(`[Hostaway] HTTP ${code}: ${res.getContentText()}`);
+      Utilities.sleep(wait); wait = Math.min(wait * 2, 8000); continue;
+    }
+    throw new Error(`[Hostaway] HTTP ${code}: ${res.getContentText()}`);
+  }
+  throw new Error('Network error after retries');
+}
