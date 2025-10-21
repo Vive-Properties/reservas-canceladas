@@ -1,0 +1,374 @@
+/******************** CONFIG PRINCIPAL ********************/
+const BASE_URL       = 'http://144.126.216.86';   // sin slash final
+const GATEWAY_USER   = 'admin';
+const GATEWAY_PASS   = '';
+const TZ             = 'America/Mexico_City';
+
+const SOURCE_SHEET   = 'Hostaway_Reservas_Canceladas_Hoy'; // reservationId + edificio (+ status)
+const DEVICES_SHEET  = 'Hikvision_Devices';
+const LOG_SHEET      = 'Hikvision_Logs';
+
+const REQUEST_SLEEP_MS = 350;
+
+/******************** ALERTAS / REINTENTOS ********************/
+const MAX_ATTEMPTS  = 3;
+const ALERT_EMAILS  = ['ipadilla@vive.properties, tecnologia@vive.properties, tecnologia@vive.properties, csupport@vive.properties, csuccess@vive.properties']; // ← CAMBIA: uno o varios destinatarios
+const ALERT_SUBJECT = 'Hikvision — Error al borrar reservas canceladas';
+
+/******************** MAPEO EDIFICIO → NOMBRES DE DEVICE ********************/
+/* Ajusta según tus nombres reales en Hikvision_Devices.devName */
+const BUILDING_TO_DEVNAMES = {
+  'tribu colon':                ['tribu colon entrada'],
+  'bitloft':                    ['tribu colon entrada'],
+  'tribu san martin':           ['tribusm'],
+  'punto panamericano':         ['panamericano'],
+  'tribu chapultepec 67':       ['tribu chapultepec 67 entrada'],
+  'tribu sonata':               ['tribu sonata elevador','tribu sonata ent'],
+  'casa 8':                     ['casa8 madera','casa8 herreria'],
+  'tribu coordenada lafayette': ['tribu lafayette']
+};
+
+/******************** ENTRADA PRINCIPAL (EJECUTAR ESTA) ********************/
+function purgeCanceledReservationsInHikvision() {
+  logInit_();
+  logI_('▶ Inicio: purga de reservas canceladas en Hikvision…');
+
+  // 1) asegurar hoja de dispositivos al día
+  refreshDevicesSheet();
+
+  // 2) leer hoja fuente
+  const ss  = SpreadsheetApp.getActive();
+  const shS = ss.getSheetByName(SOURCE_SHEET);
+  if (!shS) { logE_(`No existe la hoja "${SOURCE_SHEET}".`); return; }
+
+  const lr = shS.getLastRow(), lc = shS.getLastColumn();
+  if (lr < 2) { logI_('No hay filas para procesar.'); return; }
+
+  let headers = shS.getRange(1,1,1,lc).getDisplayValues()[0];
+  const data  = shS.getRange(2,1,lr-1,lc).getDisplayValues();
+
+  const cResId = findCol_(headers, ['reservationid','reservation id','id','id de reserva']);
+  const cEdif  = findCol_(headers, ['edificio','building','edifice']);
+  if (!cResId || !cEdif) { logE_('Faltan columnas mínimas: "reservationId" y "edificio".'); return; }
+
+  // Asegurar columna STATUS (si no existe, se crea)
+  let cStatus = findCol_(headers, ['status']);
+  if (!cStatus) {
+    shS.insertColumnAfter(lc);
+    shS.getRange(1, lc + 1).setValue('status');
+    cStatus = lc + 1;
+    headers = shS.getRange(1,1,1,shS.getLastColumn()).getDisplayValues()[0];
+  }
+
+  // 3) índice de dispositivos (desde hoja devices)
+  const devList = _readDevicesFromSheet_(); // [{devIndex, devName, norm}]
+  if (!devList.length) { logE_(`No hay dispositivos en "${DEVICES_SHEET}".`); return; }
+
+  const results = [];
+  let ok=0, err=0;
+
+  // 4) recorrer filas y ejecutar BAJAS (face + user) con reintentos y correo
+  for (let r=0; r<data.length; r++) {
+    const reservationId = String(data[r][cResId-1] || '').trim();
+    const edificio      = String(data[r][cEdif -1] || '').trim();
+
+    if (!reservationId || !edificio) { results.push(['error']); err++; continue; }
+
+    const devices = _pickDevicesForBuilding_(edificio, devList);
+    if (!devices.length) {
+      logW_(`⚠️ Sin devices para edificio "${edificio}" (res=${reservationId}).`);
+      results.push(['error']); err++; continue;
+    }
+
+    let hadError = false;
+    const failures = []; // para correo por fila
+
+    for (const dev of devices) {
+      if (!dev || !dev.devIndex) continue;
+
+      // 4.1 borrar rostro con reintentos
+      const faceRes = _withRetries_(() => deleteFace_(dev.devIndex, reservationId));
+      if (faceRes.ok) {
+        logI_(`🗑️ Rostro borrado en "${dev.devName}" (devIndex=${dev.devIndex}) | res=${reservationId}`);
+      } else {
+        hadError = true;
+        logW_(`⚠️ Falló borrar rostro (x${MAX_ATTEMPTS}) en "${dev.devName}" | res=${reservationId} | HTTP ${faceRes.http} body=${faceRes.body}`);
+        failures.push({ tipo: 'Face', devName: dev.devName, devIndex: dev.devIndex, http: faceRes.http, body: faceRes.body });
+      }
+      Utilities.sleep(REQUEST_SLEEP_MS);
+
+      // 4.2 borrar usuario con reintentos
+      const userRes = _withRetries_(() => deleteUser_(dev.devIndex, reservationId));
+      if (userRes.ok) {
+        logI_(`🗑️ Usuario borrado en "${dev.devName}" (devIndex=${dev.devIndex}) | res=${reservationId}`);
+      } else {
+        hadError = true;
+        logW_(`⚠️ Falló borrar usuario (x${MAX_ATTEMPTS}) en "${dev.devName}" | res=${reservationId} | HTTP ${userRes.http} body=${userRes.body}`);
+        failures.push({ tipo: 'User', devName: dev.devName, devIndex: dev.devIndex, http: userRes.http, body: userRes.body });
+      }
+      Utilities.sleep(REQUEST_SLEEP_MS);
+    }
+
+    // resultado por fila
+    results.push([hadError ? 'error' : 'eliminado']);
+    if (hadError) {
+      err++;
+      const html = [
+        `<p><b>Problema al borrar en Hikvision</b></p>`,
+        `<p><b>Reserva:</b> ${reservationId}<br><b>Edificio:</b> ${edificio}</p>`,
+        `<ul>`,
+        ...failures.map(f => `<li><b>${f.tipo}</b> — Device: ${f.devName} (idx ${f.devIndex}) — HTTP ${f.http} — <pre>${(f.body||'').toString()}</pre></li>`),
+        `</ul>`,
+        `<p>Intentos realizados por operación: ${MAX_ATTEMPTS}.</p>`
+      ].join('');
+      sendAlertEmail_(ALERT_SUBJECT, html);
+    } else {
+      ok++;
+    }
+  }
+
+  // 5) escribir "status" (eliminado/error)
+  if (results.length) {
+    shS.getRange(2, cStatus, results.length, 1).setValues(results);
+  }
+
+  logI_(`Fin de purga. OK=${ok} | ERROR=${err}`);
+}
+
+/******************** DEVICES: CARGA Y HOJA ********************/
+function refreshDevicesSheet() {
+  const devices = fetchAllDevices_();
+  writeDevicesSheet_(devices);
+  logI_('Hoja de dispositivos actualizada.');
+}
+function fetchAllDevices_() {
+  const url = BASE_URL + '/ISAPI/ContentMgmt/DeviceMgmt/deviceList?format=json';
+  let position = 0, page = 100, all = [];
+  while (true) {
+    const body = {
+      SearchDescription: {
+        position,
+        maxResult: page,
+        Filter: { key: '', devType: '', protocolType: ['ehomeV5'], devStatus: ['online','offline'] }
+      }
+    };
+    const res  = digestFetchJson_('POST', url, body);
+    const json = parseJsonSafe_(res.getContentText());
+    const sr   = (json && json.SearchResult) ? json.SearchResult : {};
+    const matches = ((sr.MatchList || []).map(m => m.Device || m)) || [];
+    matches.forEach(d => all.push(d));
+    const total = sr.totalMatches || all.length;
+    const num   = sr.numOfMatches || matches.length;
+    position += num;
+    if (!num || position >= total) break;
+  }
+  return all;
+}
+function writeDevicesSheet_(devices) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DEVICES_SHEET) || ss.insertSheet(DEVICES_SHEET);
+  sh.clear();
+  const headers = ['devIndex','devName','devStatus','protocolType','devSerial','devMode','devVersion','ip','port'];
+  sh.getRange(1,1,1,headers.length).setValues([headers]);
+  const rows = devices.map(d => [
+    safe_(d.devIndex), safe_(d.devName), safe_(d.devStatus), safe_(d.protocolType),
+    safe_(d.devSerial), safe_(d.devMode), safe_(d.devVersion),
+    safe_(d.devIP || d.ip), safe_(d.devPort || d.port)
+  ]);
+  if (rows.length) sh.getRange(2,1,rows.length,headers.length).setValues(rows);
+}
+// Cargar devices desde hoja a memoria
+function _readDevicesFromSheet_() {
+  const out = [];
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DEVICES_SHEET);
+  if (!sh) return out;
+  const lr = sh.getLastRow(), lc = sh.getLastColumn();
+  if (lr < 2) return out;
+  const head = sh.getRange(1,1,1,lc).getDisplayValues()[0];
+  const cIdx = head.indexOf('devIndex') + 1;
+  const cNam = head.indexOf('devName')  + 1;
+  if (!cIdx || !cNam) return out;
+  const rows = sh.getRange(2,1,lr-1,lc).getDisplayValues();
+  rows.forEach(r => {
+    const di = String(r[cIdx - 1] || '').trim();
+    const dn = String(r[cNam - 1] || '').trim();
+    if (di && dn) out.push({ devIndex: di, devName: dn, norm: normalizeKey_(dn) });
+  });
+  return out;
+}
+
+/******************** MATCH DE DISPOSITIVOS POR EDIFICIO ********************/
+function _pickDevicesForBuilding_(edificio, devList) {
+  const key = normalizeKey_(edificio);
+  const wanted = BUILDING_TO_DEVNAMES[key];
+
+  // 1) mapeo explícito por nombre exacto/contains
+  if (Array.isArray(wanted) && wanted.length) {
+    const diSet = new Set();
+    wanted.forEach(w => {
+      const wKey = normalizeKey_(w);
+      devList.forEach(d => { if (d.norm === wKey) diSet.add(d.devIndex); });
+    });
+    if (diSet.size === 0) {
+      wanted.forEach(w => {
+        const wKey = normalizeKey_(w);
+        devList.forEach(d => { if (d.norm.includes(wKey) || wKey.includes(d.norm)) diSet.add(d.devIndex); });
+      });
+    }
+    return Array.from(diSet).map(di => devList.find(d => d.devIndex === di));
+  }
+
+  // 2) heurística por substring
+  let matches = devList.filter(d => d.norm.includes(key) || key.includes(d.norm));
+  if (!matches.length) {
+    const key2 = key.replace(/\b(tribu|casa8|entrada|elevador|panamericano)\b/g,'').trim();
+    if (key2) matches = devList.filter(d => d.norm.includes(key2));
+  }
+  return matches;
+}
+
+/******************** BAJAS EN HIKVISION (CARAS / USUARIOS) ********************/
+function deleteUser_(devIndex, employeeNo) {
+  if (!employeeNo) return { ok:true, http:0, body:'' };
+  const url = BASE_URL + '/ISAPI/AccessControl/UserInfoDetail/Delete?format=json&devIndex=' + encodeURIComponent(devIndex);
+  const payload = {
+    UserInfoDetail: { mode: 'byEmployeeNo', EmployeeNoList: [ { employeeNo: String(employeeNo) } ] }
+  };
+  const res = digestFetchJson_('PUT', url, payload);
+  return { ok: res.getResponseCode() < 400, http: res.getResponseCode(), body: (res.getContentText() || '').slice(0, 500) };
+}
+function deleteFace_(devIndex, employeeNo) {
+  if (!employeeNo) return { ok: true, http: 0, body: '' };
+  const url = BASE_URL + '/ISAPI/Intelligent/FDLib/FDSearch/Delete?format=json&devIndex=' + encodeURIComponent(devIndex);
+  const payload = { FaceInfoDelCond: { EmployeeNoList: [ { employeeNo: String(employeeNo) } ] } };
+  const res = digestFetchJson_('PUT', url, payload);
+  return { ok: res.getResponseCode() < 400, http: res.getResponseCode(), body: (res.getContentText() || '').slice(0, 500) };
+}
+
+/******************** REINTENTOS + ALERTA ********************/
+function _withRetries_(fn, attempts = MAX_ATTEMPTS, sleepMs = REQUEST_SLEEP_MS) {
+  let last = { ok: false, http: 0, body: '' };
+  let wait = sleepMs;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = fn();
+      last = res;
+      if (res && res.ok) return res;
+    } catch (e) {
+      last = { ok: false, http: 0, body: (e && e.message) ? e.message.slice(0,500) : '' };
+    }
+    Utilities.sleep(wait);
+    wait = Math.min(wait * 1.5, 3000); // backoff suave
+  }
+  return last;
+}
+
+function sendAlertEmail_(subject, htmlBody) {
+  try {
+    ALERT_EMAILS.forEach(to => {
+      if (!to) return;
+      MailApp.sendEmail({ to, subject, htmlBody, name: 'Hikvision Bot' });
+    });
+  } catch (e) {
+    logE_('❌ Error al enviar alerta por correo: ' + (e && e.message));
+  }
+}
+
+/******************** LOGS ********************/
+function logInit_() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(LOG_SHEET) || ss.insertSheet(LOG_SHEET);
+  if (sh.getLastRow() === 0) sh.appendRow(['Timestamp', 'Nivel', 'Mensaje']);
+}
+function logWrite_(level, msg) {
+  try {
+    const ts = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd HH:mm:ss');
+    const ss = SpreadsheetApp.getActive();
+    const sh = ss.getSheetByName(LOG_SHEET) || ss.insertSheet(LOG_SHEET);
+    sh.appendRow([ts, level, msg]);
+    Logger.log('[' + ts + '] [' + level + '] ' + msg);
+  } catch (_e) {}
+}
+const logI_ = (m)=>logWrite_('INFO',  m);
+const logW_ = (m)=>logWrite_('WARN',  m);
+const logE_ = (m)=>logWrite_('ERROR', m);
+
+/******************** DIGEST AUTH (CORE) ********************/
+function digestFetchJson_(method, url, bodyObj) {
+  const m = method.toUpperCase();
+  const params = { method: m, followRedirects: true, muteHttpExceptions: true, headers: { 'Accept': 'application/json' } };
+  if (bodyObj !== undefined && bodyObj !== null) {
+    params.payload = JSON.stringify(bodyObj);
+    params.contentType = 'application/json';
+  }
+  return digestFetchCore_(url, params);
+}
+function digestFetchCore_(url, params) {
+  // 1er intento
+  let res = UrlFetchApp.fetch(url, params);
+  if (res.getResponseCode() !== 401) return res;
+
+  // Handshake Digest
+  const wa = (res.getAllHeaders()['WWW-Authenticate'] || res.getAllHeaders()['Www-Authenticate'] || '').toString();
+  const chal = parseDigestChallenge_(wa);
+  if (!chal) throw new Error('No se pudo parsear WWW-Authenticate para Digest.');
+
+  const uri = getPathAndQuery_(url);
+  const nc  = '00000001';
+  const cnonce = randomHex_(16);
+
+  const ha1 = md5hex_(GATEWAY_USER + ':' + chal.realm + ':' + GATEWAY_PASS);
+  const ha2 = md5hex_((params.method || 'GET') + ':' + uri);
+  const response = md5hex_([ha1, chal.nonce, nc, cnonce, chal.qop, ha2].join(':'));
+
+  const auth = [
+    'Digest username="' + GATEWAY_USER + '"',
+    'realm="' + chal.realm + '"',
+    'nonce="' + chal.nonce + '"',
+    'uri="' + uri + '"',
+    'qop=' + chal.qop,
+    'nc=' + nc,
+    'cnonce="' + cnonce + '"',
+    'response="' + response + '"',
+    'algorithm=MD5'
+  ];
+  if (chal.opaque) auth.push('opaque="' + chal.opaque + '"');
+
+  const params2 = Object.assign({}, params, {
+    headers: Object.assign({}, params.headers || {}, { Authorization: auth.join(', ') })
+  });
+  res = UrlFetchApp.fetch(url, params2);
+  return res;
+}
+function parseDigestChallenge_(wwwAuth) {
+  if (!wwwAuth || wwwAuth.indexOf('Digest') === -1) return null;
+  var out = {}, s = wwwAuth.replace(/^Digest\s+/i, ''), rx = /([a-z]+)="?([^",]+)"?/gi, m;
+  while ((m = rx.exec(s)) !== null) out[m[1]] = m[2];
+  if (out.qop && out.qop.indexOf(',') > -1) out.qop = 'auth';
+  return { realm: out.realm, nonce: out.nonce, qop: out.qop || 'auth', opaque: out.opaque };
+}
+
+/******************** UTILIDADES ********************/
+function findCol_(headers, names) {
+  const wants = names.map(normalizeKey_);
+  for (let i=0;i<headers.length;i++) if (wants.indexOf(normalizeKey_(headers[i])) >= 0) return i+1;
+  return 0;
+}
+function normalizeKey_(s) {
+  return (s || '').toString().normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g,' ').trim();
+}
+function safe_(v) { return v == null ? '' : v; }
+function parseJsonSafe_(txt) { try { return JSON.parse(txt || '{}'); } catch (_e) { return {}; } }
+function md5hex_(s) {
+  const b = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s, Utilities.Charset.UTF_8);
+  return b.map(n => ((n + 256) & 255).toString(16).padStart(2,'0')).join('');
+}
+function getPathAndQuery_(full) {
+  try { const u = new URL(full); return (u.pathname || '/') + (u.search || ''); }
+  catch (_e) { const m = full.match(/^[a-z]+:\/\/[^/]+(\/.*)$/i); return m ? m[1] : '/'; }
+}
+function randomHex_(len) {
+  const chars = 'abcdef0123456789';
+  let out = ''; for (let i=0;i<len;i++) out += chars.charAt(Math.floor(Math.random()*chars.length)); return out;
+}
